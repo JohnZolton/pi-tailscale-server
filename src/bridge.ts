@@ -40,25 +40,36 @@ export class PiBridge {
 
     wss.on("connection", (ws) => {
       const transport = new WebSocketTransport(ws, `ws_${Date.now()}`);
-
-      transport.onOpen = () => {
-        transport.send("state_sync", {});
-      };
-
-      transport.onMessage = (type, data) => {
-        if (type === "send" && (data.text as string)?.trim()) {
-          const threadId = (data.thread as string) ?? "default";
-          this.handleSend(transport, threadId, (data.text as string).trim()).catch(() => {});
-        } else if (type === "list_dir") {
-          this.handleListDir(transport, (data.path as string) ?? "/").catch(() => {});
-        }
-      };
+      this.setupTransport(transport);
+      transport.onOpen?.();
     });
 
     const cfg = this.config;
     server.listen(cfg.wsPort, "0.0.0.0", () => {
       console.log(`pi-bridge on port ${cfg.wsPort}`);
     });
+  }
+
+  /**
+   * Register an external transport (e.g. from WebRTC DataChannel).
+   * The transport's onMessage/onClose/onError callbacks are wired
+   * the same way as WebSocket connections.
+   */
+  addTransport(transport: Transport): void {
+    this.setupTransport(transport);
+    transport.onOpen?.();
+  }
+
+  /** Shared setup for any Transport — wires message dispatch. */
+  private setupTransport(transport: Transport): void {
+    transport.onMessage = (type, data) => {
+      if (type === "send" && (data.text as string)?.trim()) {
+        const threadId = (data.thread as string) ?? "default";
+        this.handleSend(transport, threadId, (data.text as string).trim()).catch(() => {});
+      } else if (type === "list_dir") {
+        this.handleListDir(transport, (data.path as string) ?? "/").catch(() => {});
+      }
+    };
   }
 
   // ── Send ────────────────────────────────────────────────────────────

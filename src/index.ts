@@ -21,6 +21,7 @@ import { loadConfig } from "./config.js";
 import { PiBridge } from "./bridge.js";
 import { loadOrCreateIdentity, getPairingData } from "./identity.js";
 import { NostrSignaler } from "./signaler.js";
+import { WebRtcManager } from "./webrtc-transport.js";
 
 async function main() {
   const config = loadConfig();
@@ -30,25 +31,21 @@ async function main() {
   console.log(`Pubkey: ${identity.pubkey}`);
   console.log(`Relays: ${identity.relays.join(", ")}`);
 
-  // ── 2. Nostr signaling ──
-  const signaler = new NostrSignaler(identity);
-  signaler.on({
-    onOffer: (msg, fromPubkey) => {
-      console.log(`[signal] Offer from ${fromPubkey.slice(0, 12)}...`);
-      // Phase 3: create WebRTC peer, send answer
-    },
-    onAnswer: (msg, fromPubkey) => {
-      console.log(`[signal] Answer from ${fromPubkey.slice(0, 12)}...`);
-    },
-    onIce: (msg, fromPubkey) => {
-      console.log(`[signal] ICE from ${fromPubkey.slice(0, 12)}...`);
-    },
-  });
-  signaler.start().catch((e) => console.warn("[signal] start error:", e.message));
-
-  // ── 3. PiBridge (WebSocket path) ──
+  // ── 2. PiBridge (WebSocket path for Tailscale/dev) ──
   const bridge = new PiBridge(config);
   await bridge.start();
+
+  // ── 3. Nostr signaling + WebRTC ──
+  const signaler = new NostrSignaler(identity);
+  const webrtc = new WebRtcManager(identity, signaler);
+
+  // When a WebRTC DataChannel opens, plug it into the bridge
+  webrtc.onTransport = (transport) => {
+    console.log(`[index] WebRTC transport ready: ${transport.peerId}`);
+    bridge.addTransport(transport);
+  };
+
+  signaler.start().catch((e) => console.warn("[signal] start error:", e.message));
 
   // ── 4. Local HTTP endpoint for pairing data ──
   const httpPort = parseInt(process.env.HTTP_PORT ?? "3003", 10);

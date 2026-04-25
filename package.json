@@ -21,6 +21,7 @@
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.70.2",
     "@noble/curves": "^2.2.0",
+    "node-datachannel": "^0.32.2",
     "nostr-tools": "^2.23.3",
     "ws": "^8.20.0"
   },
