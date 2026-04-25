@@ -63,6 +63,7 @@ export class PiBridge {
   // ── Send ────────────────────────────────────────────────────────────
 
   private async handleSend(ws: WebSocket, threadId: string, text: string) {
+    const tid = threadId;
     let ts: ThreadState | undefined | null = threadSessions.get(threadId);
 
     // Handle /dir specially — creates new session with new cwd
@@ -93,7 +94,7 @@ export class PiBridge {
 
     if (await this.handleCommand(ts, ws, text)) return;
     ts.lastActivity = Date.now();
-    await this.runPrompt(ts, ws, text);
+    await this.runPrompt(ts, ws, text, threadId);
   }
 
   // ── List directory ─────────────────────────────────────────────────
@@ -173,25 +174,26 @@ export class PiBridge {
 
   // ── Run prompt ────────────────────────────────────────────────────
 
-  private async runPrompt(ts: ThreadState, ws: WebSocket, promptText: string) {
+  private async runPrompt(ts: ThreadState, ws: WebSocket, promptText: string, tid: string) {
     let responseText = "", thinkingText = "", deltaSeq = 0;
     let unsub: (() => void) | undefined;
+    const send = (type: string, data: any) => ws.send(JSON.stringify({ type, data: { ...data, thread: tid } }));
 
     try {
       unsub = ts.session.subscribe((event: AgentSessionEvent) => {
         if (event.type === "message_update" && "assistantMessageEvent" in event) {
           const e = (event as any).assistantMessageEvent;
-          if (e?.type === "thinking_delta") { thinkingText += e.delta ?? ""; ws.send(JSON.stringify({ type: "thinking", data: { text: thinkingText } })); }
-          if (e?.type === "text_delta") { responseText += e.delta ?? ""; deltaSeq++; ws.send(JSON.stringify({ type: "text_delta", data: { text: responseText, seq: deltaSeq, more: true } })); }
+          if (e?.type === "thinking_delta") { thinkingText += e.delta ?? ""; send("thinking", { text: thinkingText }); }
+          if (e?.type === "text_delta") { responseText += e.delta ?? ""; deltaSeq++; send("text_delta", { text: responseText, seq: deltaSeq, more: true }); }
         }
         if (event.type === "tool_execution_start") {
           const ev = event as any;
-          ws.send(JSON.stringify({ type: "tool_call", data: { id: ev.toolCallId ?? "", name: ev.toolName ?? "", args: ev.args ?? {}, status: "running" } }));
+          send("tool_call", { id: ev.toolCallId ?? "", name: ev.toolName ?? "", args: ev.args ?? {}, status: "running" });
           console.log(`→ ${ev.toolName}`);
         }
         if (event.type === "tool_execution_end") {
           const ev = event as any;
-          ws.send(JSON.stringify({ type: "tool_call", data: { id: ev.toolCallId ?? "", name: ev.toolName ?? "", status: ev.isError ? "error" : "complete" } }));
+          send("tool_call", { id: ev.toolCallId ?? "", name: ev.toolName ?? "", status: ev.isError ? "error" : "complete" });
           console.log(`← ${ev.toolName} ${ev.isError ? "❌" : "✓"}`);
         }
       });
@@ -199,8 +201,8 @@ export class PiBridge {
       ts.lastActivity = Date.now();
       await ts.session.prompt(promptText);
       if (unsub) unsub();
-      ws.send(JSON.stringify({ type: "text_delta", data: { text: responseText, seq: deltaSeq, more: false } }));
-      ws.send(JSON.stringify({ type: "turn_complete", data: {} }));
+      send("text_delta", { text: responseText, seq: deltaSeq, more: false });
+      send("turn_complete", {});
     } catch (e: any) {
       if (unsub) unsub();
       console.error(`[session] ${e?.message}`);
