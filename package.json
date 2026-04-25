@@ -1,0 +1,31 @@
+{
+  "name": "pi-nostr-bridge",
+  "version": "0.1.0",
+  "description": "Nostr NIP-17 DM bridge for pi coding agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "pi-nostr-bridge": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "pi",
+    "nostr",
+    "nip17",
+    "coding-agent"
+  ],
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.70.2",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
