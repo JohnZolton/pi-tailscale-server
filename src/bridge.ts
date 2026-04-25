@@ -1,13 +1,12 @@
 /**
- * pi-nostr-bridge — pure WebSocket server wrapping pi.
- * No Nostr, no keypairs, no relays. Just TypeScript, pi SDK, and a WebSocket.
- *
- * Architecture:
- *   Phone ──Tailscale──► WebSocket ──► pi session ──► streaming JSON frames
+ * pi-bridge — WebSocket server wrapping pi.
+ * Supports multiple threads per connection, keyed by thread ID.
  */
 
 import { WebSocketServer, type WebSocket } from "ws";
 import * as http from "node:http";
+import * as fs from "node:fs";
+import * as pathLib from "node:path";
 
 import {
   type AgentSession, type AgentSessionEvent,
@@ -17,154 +16,139 @@ import {
 
 import type { BridgeConfig } from "./config.js";
 
-// ── Per-connection state ─────────────────────────────────────────────
-
-interface ConnState {
-  ws: WebSocket;
+interface ThreadState {
   session: AgentSession;
   sessionManager: SessionManager;
+  cwd: string;
   currentModel: string;
   lastActivity: number;
 }
 
-// ── Bridge ───────────────────────────────────────────────────────────
+// Sessions keyed by thread ID
+const threadSessions = new Map<string, ThreadState>();
 
 export class PiBridge {
-  private connections = new Map<string, ConnState>();
-
   constructor(private config: BridgeConfig) {}
 
   async start() {
-    const cfg = this.config;
-    const server = http.createServer((req, res) => {
-      res.writeHead(200).end(JSON.stringify({ ok: true, uptime: process.uptime() }));
-    });
-
+    const server = http.createServer();
     const wss = new WebSocketServer({ server });
 
     wss.on("connection", (ws: WebSocket) => {
-      const connId = crypto.randomUUID().slice(0, 8);
-      console.log(`[ws] ${connId} connected`);
-
-      ws.send(JSON.stringify({ type: "state_sync", data: { connId } }));
+      ws.send(JSON.stringify({ type: "state_sync", data: {} }));
 
       ws.on("message", async (raw) => {
         try {
           const msg = JSON.parse(raw.toString());
-          if (msg.type === "send" && msg.data?.text?.trim()) {
-            await this.handleSend(connId, ws, msg.data.text.trim());
+          const data = msg.data ?? {};
+
+          if (msg.type === "send" && data.text?.trim()) {
+            const threadId = data.thread ?? "default";
+            await this.handleSend(ws, threadId, data.text.trim());
+          } else if (msg.type === "list_dir") {
+            await this.handleListDir(ws, data.path ?? "/");
           }
         } catch (e: any) {
-          ws.send(JSON.stringify({ type: "error", data: { message: e?.message ?? "parse error" } }));
+          ws.send(JSON.stringify({ type: "error", data: { message: e?.message ?? "error" } }));
         }
       });
-
-      ws.on("close", () => {
-        const state = this.connections.get(connId);
-        if (state) try { state.session.dispose(); } catch {}
-        this.connections.delete(connId);
-        console.log(`[ws] ${connId} disconnected`);
-      });
-
-      ws.on("error", () => this.connections.delete(connId));
     });
 
+    const cfg = this.config;
     server.listen(cfg.wsPort, "0.0.0.0", () => {
-      console.log(`pi-bridge listening on port ${cfg.wsPort}`);
-      console.log(`Connect via Tailscale: ws://100.x.x.x:${cfg.wsPort}`);
+      console.log(`pi-bridge on port ${cfg.wsPort}`);
     });
   }
 
-  // ── Handle a message ──────────────────────────────────────────────
+  // ── Send ────────────────────────────────────────────────────────────
 
-  private async handleSend(connId: string, ws: WebSocket, text: string) {
-    // Get or create session for this connection
-    let conn = this.connections.get(connId);
-    if (!conn) {
-      const created = await this.createSession(ws);
-      if (!created) {
-        ws.send(JSON.stringify({ type: "error", data: { message: "Failed to create pi session" } }));
+  private async handleSend(ws: WebSocket, threadId: string, text: string) {
+    let ts: ThreadState | undefined | null = threadSessions.get(threadId);
+
+    // Handle /dir specially — creates new session with new cwd
+    const cmd = text.toLowerCase();
+    if (cmd.startsWith("/dir ") || cmd.startsWith("!dir ")) {
+      const newCwd = text.split(/[\s]+/).slice(1).join(" ").trim();
+      if (!newCwd) return;
+      const resolved = pathLib.resolve(newCwd);
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+        ws.send(JSON.stringify({ type: "text_delta", data: { text: `❌ Not a directory: ${resolved}`, seq: 0, more: false } }));
         return;
       }
-      this.connections.set(connId, created);
-      conn = created;
+      // Dispose old session for this thread, create new one
+      if (ts) try { ts.session.dispose(); } catch {}
+      const created = await this.createSession(resolved);
+      if (created) {
+        threadSessions.set(threadId, created);
+        ws.send(JSON.stringify({ type: "state_sync", data: { cwd: resolved } }));
+      }
+      return;
     }
 
-    // Check for commands
-    if (await this.handleCommand(conn, ws, text)) return;
+    if (!ts) {
+      ts = await this.createSession(this.config.cwd);
+      if (!ts) { ws.send(JSON.stringify({ type: "error", data: { message: "Failed" } })); return; }
+      threadSessions.set(threadId, ts);
+    }
 
-    // Run prompt
-    conn.lastActivity = Date.now();
-    await this.runPrompt(conn, text);
+    if (await this.handleCommand(ts, ws, text)) return;
+    ts.lastActivity = Date.now();
+    await this.runPrompt(ts, ws, text);
+  }
+
+  // ── List directory ─────────────────────────────────────────────────
+
+  private async handleListDir(ws: WebSocket, dirPath: string) {
+    try {
+      const resolved = pathLib.resolve(dirPath);
+      const entries = fs.readdirSync(resolved, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => ({ name: d.name, path: pathLib.join(resolved, d.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      ws.send(JSON.stringify({ type: "dir_list", data: { path: resolved, entries } }));
+    } catch (e: any) {
+      ws.send(JSON.stringify({ type: "dir_list", data: { path: dirPath, entries: [], error: e?.message } }));
+    }
   }
 
   // ── Create pi session ─────────────────────────────────────────────
 
-  private async createSession(ws: WebSocket): Promise<ConnState | null> {
+  private async createSession(cwd: string): Promise<ThreadState | null> {
     try {
       const cfg = this.config;
-      const sm = SessionManager.create(cfg.cwd);
-      const settings = SettingsManager.inMemory({
-        compaction: { enabled: true }, retry: { enabled: true, maxRetries: 2 },
-      });
+      const sm = SessionManager.create(cwd);
+      const settings = SettingsManager.inMemory({ compaction: { enabled: true }, retry: { enabled: true, maxRetries: 2 } });
       const auth = AuthStorage.create();
       const registry = ModelRegistry.create(auth);
-
       const { session } = await createAgentSession({
-        cwd: cfg.cwd, agentDir: cfg.agentDir || undefined,
+        cwd, agentDir: cfg.agentDir || undefined,
         sessionManager: sm, settingsManager: settings,
         authStorage: auth, modelRegistry: registry,
       });
-
-      const model = session.model;
-      const label = model ? `${model.provider}/${model.id}` : "default";
-
-      return { ws, session, sessionManager: sm, currentModel: label, lastActivity: Date.now() };
-    } catch (e: any) {
-      console.error(`[session] ${e?.message}`);
-      return null;
-    }
+      return { session, sessionManager: sm, cwd, currentModel: session.model ? `${session.model.provider}/${session.model.id}` : "default", lastActivity: Date.now() };
+    } catch (e: any) { console.error(`[session] ${e?.message}`); return null; }
   }
 
   // ── Commands ──────────────────────────────────────────────────────
 
-  private async handleCommand(state: ConnState, ws: WebSocket, text: string): Promise<boolean> {
+  private async handleCommand(ts: ThreadState, ws: WebSocket, text: string): Promise<boolean> {
     const cmd = text.toLowerCase();
-    const send = (t: string) => ws.send(JSON.stringify({
-      type: "text_delta", data: { text: t, seq: 0, more: false },
-    }));
+    const send = (t: string) => ws.send(JSON.stringify({ type: "text_delta", data: { text: t, seq: 0, more: false } }));
 
-    if (cmd === "/help" || cmd === "!help") {
-      send("Commands: /model <name>, /models, /model, /reset, /stats");
-      return true;
-    }
-
-    if (cmd === "/stats" || cmd === "!stats") {
-      send(`Model: ${state.currentModel}`);
-      send(`Messages: ${state.sessionManager.getEntries().length}`);
-      return true;
-    }
+    if (cmd === "/help" || cmd === "!help") { send("Commands: /model <name>, /models, /dir <path>, /reset, /stats"); return true; }
+    if (cmd === "/stats" || cmd === "!stats") { send(`Model: ${ts.currentModel}\nCWD: ${ts.cwd}`); return true; }
 
     if (cmd === "/reset" || cmd === "!reset") {
-      try { await state.session.abort(); state.session.dispose(); } catch {}
-      const newState = await this.createSession(state.ws);
-      if (newState) {
-        this.connections.set([...this.connections.entries()].find(([, s]) => s === state)?.[0] ?? "", newState);
-        state.session = newState.session;
-        state.sessionManager = newState.sessionManager;
-        state.currentModel = newState.currentModel;
-      }
-      send("🔄 Reset.");
-      return true;
+      try { await ts.session.abort(); ts.session.dispose(); } catch {}
+      const newTs = await this.createSession(ts.cwd);
+      if (newTs) Object.assign(ts, newTs);
+      send("🔄 Reset."); return true;
     }
 
     if (cmd === "/models" || cmd === "!models") {
       try {
-        const registry = ModelRegistry.create(AuthStorage.create());
-        const available = await registry.getAvailable();
-        const lines = available.slice(0, 30).map((m: any) =>
-          `  ${m.provider}/${m.id}${m.id === state.currentModel ? " ◀" : ""}`
-        );
+        const available = await ModelRegistry.create(AuthStorage.create()).getAvailable();
+        const lines = available.slice(0, 30).map((m: any) => `  ${m.provider}/${m.id}${m.id === ts.currentModel ? " ◀" : ""}`);
         send(`${available.length} available:`);
         for (const l of lines) send(l);
       } catch { send("❌ Could not list models"); }
@@ -173,69 +157,50 @@ export class PiBridge {
 
     if (cmd.startsWith("/model ") || cmd.startsWith("!model ")) {
       const name = text.split(/[\s]+/).slice(1).join(" ").trim();
-      if (!name) { send(`Current: ${state.currentModel}`); return true; }
+      if (!name) { send(`Current: ${ts.currentModel}`); return true; }
       try {
-        const registry = ModelRegistry.create(AuthStorage.create());
-        const available = await registry.getAvailable();
-        const model = available.find((m: any) =>
-          `${m.provider}/${m.id}`.toLowerCase().includes(name.toLowerCase()) ||
-          m.id.toLowerCase().includes(name.toLowerCase())
-        );
-        if (model) {
-          await state.session.setModel(model);
-          state.currentModel = `${model.provider}/${model.id}`;
-          send(`✅ ${state.currentModel}`);
-        } else {
-          send(`❌ No model matching "${name}"`);
-        }
+        const available = await ModelRegistry.create(AuthStorage.create()).getAvailable();
+        const model = available.find((m: any) => `${m.provider}/${m.id}`.toLowerCase().includes(name.toLowerCase()) || m.id.toLowerCase().includes(name.toLowerCase()));
+        if (model) { await ts.session.setModel(model); ts.currentModel = `${model.provider}/${model.id}`; send(`✅ ${ts.currentModel}`); }
+        else send(`❌ No model matching "${name}"`);
       } catch (e: any) { send(`❌ ${e?.message}`); }
       return true;
     }
-
-    if (cmd === "/model" || cmd === "!model") {
-      send(`Current: ${state.currentModel}`);
-      send(`/models to list, /model <name> to switch`);
-      return true;
-    }
+    if (cmd === "/model" || cmd === "!model") { send(`Current: ${ts.currentModel}`); return true; }
 
     return false;
   }
 
   // ── Run prompt ────────────────────────────────────────────────────
 
-  private async runPrompt(state: ConnState, promptText: string) {
-    const ws = state.ws;
+  private async runPrompt(ts: ThreadState, ws: WebSocket, promptText: string) {
     let responseText = "", thinkingText = "", deltaSeq = 0;
     let unsub: (() => void) | undefined;
 
     try {
-      unsub = state.session.subscribe((event: AgentSessionEvent) => {
-        if (event.type !== "message_update" || !("assistantMessageEvent" in event)) return;
-        const e = (event as any).assistantMessageEvent;
-        if (e?.type === "thinking_delta") {
-          thinkingText += e.delta ?? "";
-          ws.send(JSON.stringify({ type: "thinking", data: { text: thinkingText } }));
+      unsub = ts.session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_update" && "assistantMessageEvent" in event) {
+          const e = (event as any).assistantMessageEvent;
+          if (e?.type === "thinking_delta") { thinkingText += e.delta ?? ""; ws.send(JSON.stringify({ type: "thinking", data: { text: thinkingText } })); }
+          if (e?.type === "text_delta") { responseText += e.delta ?? ""; deltaSeq++; ws.send(JSON.stringify({ type: "text_delta", data: { text: responseText, seq: deltaSeq, more: true } })); }
         }
-        if (e?.type === "text_delta") {
-          responseText += e.delta ?? ""; deltaSeq++;
-          ws.send(JSON.stringify({ type: "text_delta", data: { text: responseText, seq: deltaSeq, more: true } }));
+        if (event.type === "tool_execution_start") {
+          const ev = event as any;
+          ws.send(JSON.stringify({ type: "tool_call", data: { id: ev.toolCallId ?? "", name: ev.toolName ?? "", args: ev.args ?? {}, status: "running" } }));
+          console.log(`→ ${ev.toolName}`);
+        }
+        if (event.type === "tool_execution_end") {
+          const ev = event as any;
+          ws.send(JSON.stringify({ type: "tool_call", data: { id: ev.toolCallId ?? "", name: ev.toolName ?? "", status: ev.isError ? "error" : "complete" } }));
+          console.log(`← ${ev.toolName} ${ev.isError ? "❌" : "✓"}`);
         }
       });
 
-      state.lastActivity = Date.now();
-      await state.session.prompt(promptText);
+      ts.lastActivity = Date.now();
+      await ts.session.prompt(promptText);
       if (unsub) unsub();
-
       ws.send(JSON.stringify({ type: "text_delta", data: { text: responseText, seq: deltaSeq, more: false } }));
       ws.send(JSON.stringify({ type: "turn_complete", data: {} }));
-
-      // Extract diffs
-      const diffRegex = /```diff\n([\s\S]*?)```/g;
-      let match: RegExpExecArray | null;
-      while ((match = diffRegex.exec(responseText)) !== null) {
-        const fileMatch = match[1].match(/^[+]{3} [ab]\/(.+)$/m);
-        ws.send(JSON.stringify({ type: "diff", data: { file: fileMatch?.[1]?.trim() ?? "file", diff: match[1], status: "modified" } }));
-      }
     } catch (e: any) {
       if (unsub) unsub();
       console.error(`[session] ${e?.message}`);
