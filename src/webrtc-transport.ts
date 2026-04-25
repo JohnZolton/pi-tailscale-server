@@ -124,31 +124,22 @@ export class WebRtcManager {
   private async handleOffer(msg: SignalingMessage & { type: "webrtc-offer" }, fromPubkey: string): Promise<void> {
     console.log(`[webrtc] Offer from ${fromPubkey.slice(0, 12)}...`);
 
-    // Verify pairing code (in production, validate against identity.pairingCode)
     const peerId = fromPubkey.slice(0, 16);
 
-    // Create PeerConnection
+    // Create PeerConnection with STUN
     const pc = new nd.PeerConnection(peerId, { iceServers: STUN_SERVERS });
     this.peers.set(peerId, pc);
 
     // Create DataChannel
     const dc = pc.createDataChannel("pi-bridge");
 
-    // Wire up ICE candidate exchange
-    pc.onLocalCandidate((candidate, mid) => {
-      this.signaler.sendMessage(fromPubkey, {
-        type: "webrtc-ice",
-        candidate: `${candidate}|${mid}`,
-      }).catch(() => {});
-    });
+    // Set remote description (the app's offer)
+    pc.setRemoteDescription(msg.sdp, "offer");
 
-    // Flush any buffered ICE candidates
+    // When local description (answer) is ready, send it
     pc.onLocalDescription((sdp, type) => {
       if (type === "answer") {
-        // Set remote description first
-        pc.setRemoteDescription(msg.sdp, "offer");
-
-        // Flush buffered ICE candidates
+        // Flush any buffered ICE candidates
         const buffer = this.iceBuffer.get(peerId);
         if (buffer) {
           for (const ic of buffer) {
@@ -157,29 +148,27 @@ export class WebRtcManager {
           this.iceBuffer.delete(peerId);
         }
 
-        // Send answer back over Nostr
-        this.signaler.sendMessage(fromPubkey, {
-          type: "webrtc-answer",
-          sdp,
-        });
+        this.signaler.sendMessage(fromPubkey, { type: "webrtc-answer", sdp }).catch(() => {});
       }
     });
 
-    // When DataChannel opens, expose the transport
-    const transport = new DataChannelTransport(dc, peerId);
-    pc.onDataChannel((incomingDc) => {
-      // Peer created the DC on their side
+    // Send ICE candidates back over Nostr
+    pc.onLocalCandidate((candidate, mid) => {
+      this.signaler.sendMessage(fromPubkey, {
+        type: "webrtc-ice",
+        candidate: `${candidate}|${mid}`,
+      }).catch(() => {});
     });
 
-    // Wait for DC to open, then fire onTransport
+    // Create the answer (triggers onLocalDescription)
+    pc.setLocalDescription("answer");
+
+    // When DataChannel opens, expose the transport
+    const transport = new DataChannelTransport(dc, peerId);
     dc.onOpen(() => {
       console.log(`[webrtc] P2P connected: ${peerId}`);
       this.onTransport?.(transport);
     });
-
-    // Create answer
-    pc.setRemoteDescription(msg.sdp, "offer");
-    pc.setLocalDescription("answer");
   }
 
   // ── Answer (Bridge → Android) — used when bridge initiates  ──
