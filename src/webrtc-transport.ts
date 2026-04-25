@@ -133,11 +133,10 @@ export class WebRtcManager {
     // Create DataChannel
     const dc = pc.createDataChannel("pi-bridge");
 
-    // Set remote description (the app's offer)
-    pc.setRemoteDescription(msg.sdp, "offer");
-
+    // Wire callbacks BEFORE setting descriptions (required by node-datachannel)
     // When local description (answer) is ready, send it
     pc.onLocalDescription((sdp, type) => {
+      console.log(`[webrtc] Local description: ${type}`);
       if (type === "answer") {
         // Flush any buffered ICE candidates
         const buffer = this.iceBuffer.get(peerId);
@@ -154,14 +153,28 @@ export class WebRtcManager {
 
     // Send ICE candidates back over Nostr
     pc.onLocalCandidate((candidate, mid) => {
+      console.log(`[webrtc] ICE candidate: ${candidate.slice(0, 30)}...`);
       this.signaler.sendMessage(fromPubkey, {
         type: "webrtc-ice",
         candidate: `${candidate}|${mid}`,
       }).catch(() => {});
     });
 
-    // Create the answer (triggers onLocalDescription)
-    pc.setLocalDescription("answer");
+    // Set remote description (the app's offer), then create answer
+    try {
+      pc.setRemoteDescription(msg.sdp, "offer");
+      console.log(`[webrtc] Remote description set, creating answer...`);
+    } catch (e) {
+      console.error(`[webrtc] setRemoteDescription failed: ${(e as Error).message}`);
+      console.error(`[webrtc] SDP was: ${msg.sdp.slice(0, 100)}...`);
+      return;
+    }
+
+    try {
+      pc.setLocalDescription("answer");
+    } catch (e) {
+      console.error(`[webrtc] setLocalDescription failed: ${(e as Error).message}`);
+    }
 
     // When DataChannel opens, expose the transport
     const transport = new DataChannelTransport(dc, peerId);
