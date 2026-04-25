@@ -176,11 +176,33 @@ export class PiBridge {
 
   private async runPrompt(ts: ThreadState, ws: WebSocket, promptText: string, tid: string) {
     let responseText = "", thinkingText = "", deltaSeq = 0;
+    let currentMessageId: string | undefined;
     let unsub: (() => void) | undefined;
     const send = (type: string, data: any) => ws.send(JSON.stringify({ type, data: { ...data, thread: tid } }));
 
+    /** Flush the current accumulated responseText as a completed segment. */
+    function flushResponse() {
+      if (responseText !== "" || deltaSeq > 0) {
+        send("text_delta", { text: responseText, seq: deltaSeq, more: false });
+        responseText = "";
+        thinkingText = "";
+        deltaSeq = 0;
+        currentMessageId = undefined;
+      }
+    }
+
     try {
       unsub = ts.session.subscribe((event: AgentSessionEvent) => {
+        // When a new assistant message starts (e.g. from an inner chat tool),
+        // flush the previous message's text so it becomes its own bubble.
+        if (event.type === "message_start" && (event as any).message?.role === "assistant") {
+          const msgId = (event as any).message?.responseId;
+          if (msgId && msgId !== currentMessageId && currentMessageId !== undefined) {
+            flushResponse();
+          }
+          currentMessageId = msgId ?? `msg_${Date.now()}_${Math.random()}`;
+        }
+
         if (event.type === "message_update" && "assistantMessageEvent" in event) {
           const e = (event as any).assistantMessageEvent;
           if (e?.type === "thinking_delta") { thinkingText += e.delta ?? ""; send("thinking", { text: thinkingText }); }
@@ -196,12 +218,17 @@ export class PiBridge {
           send("tool_call", { id: ev.toolCallId ?? "", name: ev.toolName ?? "", status: ev.isError ? "error" : "complete" });
           console.log(`← ${ev.toolName} ${ev.isError ? "❌" : "✓"}`);
         }
+        // When a turn ends (tool results processed, starting a new LLM call),
+        // flush so the next assistant message starts a fresh text bubble.
+        if (event.type === "turn_end") {
+          flushResponse();
+        }
       });
 
       ts.lastActivity = Date.now();
       await ts.session.prompt(promptText);
       if (unsub) unsub();
-      send("text_delta", { text: responseText, seq: deltaSeq, more: false });
+      flushResponse();
       send("turn_complete", {});
     } catch (e: any) {
       if (unsub) unsub();
