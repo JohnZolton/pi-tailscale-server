@@ -135,15 +135,19 @@ export class NostrSignaler {
 
     // Only handle events addressed to us
     const pTags = event.tags.filter((t) => t[0] === "p");
-    if (!pTags.some((t) => t[1] === identity.pubkey)) return;
+    if (!pTags.some((t) => t[1] === identity.pubkey)) {
+      return;
+    }
+    console.log(`[signaler] Received event from ${event.pubkey.slice(0, 12)}... (kind ${event.kind})`);
 
     // Decrypt with NIP-44
     let plaintext: string;
     try {
       const convKey = this.getConversationKey(skBytes, event.pubkey);
       plaintext = nip44.decrypt(event.content, convKey);
-    } catch {
-      return; // couldn't decrypt
+    } catch (e) {
+      console.warn(`[signaler] Decrypt failed from ${event.pubkey.slice(0, 12)}...: ${(e as Error).message}`);
+      return;
     }
 
     // Parse signaling message
