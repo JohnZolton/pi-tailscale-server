@@ -130,10 +130,9 @@ export class WebRtcManager {
     const pc = new nd.PeerConnection(peerId, { iceServers: STUN_SERVERS });
     this.peers.set(peerId, pc);
 
-    // Create DataChannel
-    const dc = pc.createDataChannel("pi-bridge");
+    let transport: DataChannelTransport | undefined;
 
-    // Wire callbacks BEFORE setting descriptions (required by node-datachannel)
+    // Wire callbacks BEFORE setting descriptions
     // When local description (answer) is ready, send it
     pc.onLocalDescription((sdp, type) => {
       console.log(`[webrtc] Local description: ${type}`);
@@ -160,27 +159,37 @@ export class WebRtcManager {
       }).catch(() => {});
     });
 
+    // Answerer side: receive DataChannel from the offerer, don't create one
+    pc.onDataChannel((dc) => {
+      console.log(`[webrtc] DataChannel received`);
+      transport = new DataChannelTransport(dc, peerId);
+    });
+
     // Set remote description (the app's offer), then create answer
     try {
       pc.setRemoteDescription(msg.sdp, "offer");
       console.log(`[webrtc] Remote description set, creating answer...`);
     } catch (e) {
       console.error(`[webrtc] setRemoteDescription failed: ${(e as Error).message}`);
-      console.error(`[webrtc] SDP was: ${msg.sdp.slice(0, 100)}...`);
       return;
     }
 
     try {
       pc.setLocalDescription("answer");
+      console.log(`[webrtc] Answer created`);
     } catch (e) {
       console.error(`[webrtc] setLocalDescription failed: ${(e as Error).message}`);
     }
 
-    // When DataChannel opens, expose the transport
-    const transport = new DataChannelTransport(dc, peerId);
-    dc.onOpen(() => {
-      console.log(`[webrtc] P2P connected: ${peerId}`);
-      this.onTransport?.(transport);
+    // Monitor ICE connection state for connectivity
+    pc.onIceStateChange((state) => {
+      console.log(`[webrtc] ICE state: ${state}`);
+      if (state === "connected" || state === "completed") {
+        console.log(`[webrtc] P2P connected: ${peerId}`);
+        if (transport) {
+          this.onTransport?.(transport);
+        }
+      }
     });
   }
 
