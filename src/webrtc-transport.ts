@@ -11,8 +11,6 @@ import { type Transport } from "./transport.js";
 import { NostrSignaler, type SignalingMessage } from "./signaler.js";
 import type { BridgeIdentity } from "./identity.js";
 
-nd.initLogger("Error");
-
 /** STUN servers for NAT traversal (Google's public STUN). */
 const STUN_SERVERS = ["stun:stun.l.google.com:19302"];
 
