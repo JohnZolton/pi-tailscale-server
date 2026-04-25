@@ -163,6 +163,10 @@ export class WebRtcManager {
     pc.onDataChannel((dc) => {
       console.log(`[webrtc] DataChannel received`);
       transport = new DataChannelTransport(dc, peerId);
+      // Also fire onTransport when the DC opens
+      (transport as DataChannelTransport).onOpen = () => {
+        this.onTransport?.(transport!);
+      };
     });
 
     // Set remote description (the app's offer), then create answer
