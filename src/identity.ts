@@ -31,7 +31,6 @@ const IDENTITY_FILE = pathLib.join(IDENTITY_DIR, "identity.json");
 const DEFAULT_RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
-  "wss://relay.nostr.band",
 ];
 
 function hex(bytes: Uint8Array): string {
@@ -45,6 +44,8 @@ export function loadOrCreateIdentity(): BridgeIdentity {
       const raw = fs.readFileSync(IDENTITY_FILE, "utf8");
       const parsed = JSON.parse(raw) as BridgeIdentity;
       if (parsed.privkey && parsed.pubkey) {
+        // Filter out problematic relays
+        parsed.relays = parsed.relays.filter(r => !r.includes("nostr.band"));
         console.log(`[identity] Loaded ${parsed.pubkey.slice(0, 12)}...`);
         return parsed;
       }
