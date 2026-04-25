@@ -1,9 +1,12 @@
 /**
- * pi-bridge — WebSocket server wrapping pi.
+ * pi-bridge — Server wrapping pi.
  * Supports multiple threads per connection, keyed by thread ID.
+ *
+ * Transport-agnostic: receives and sends frames through a Transport
+ * interface (WebSocket, WebRTC DataChannel, etc.).
  */
 
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocketServer } from "ws";
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as pathLib from "node:path";
@@ -15,6 +18,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 
 import type { BridgeConfig } from "./config.js";
+import { type Transport, WebSocketTransport } from "./transport.js";
 
 interface ThreadState {
   session: AgentSession;
@@ -34,24 +38,21 @@ export class PiBridge {
     const server = http.createServer();
     const wss = new WebSocketServer({ server });
 
-    wss.on("connection", (ws: WebSocket) => {
-      ws.send(JSON.stringify({ type: "state_sync", data: {} }));
+    wss.on("connection", (ws) => {
+      const transport = new WebSocketTransport(ws, `ws_${Date.now()}`);
 
-      ws.on("message", async (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          const data = msg.data ?? {};
+      transport.onOpen = () => {
+        transport.send("state_sync", {});
+      };
 
-          if (msg.type === "send" && data.text?.trim()) {
-            const threadId = data.thread ?? "default";
-            await this.handleSend(ws, threadId, data.text.trim());
-          } else if (msg.type === "list_dir") {
-            await this.handleListDir(ws, data.path ?? "/");
-          }
-        } catch (e: any) {
-          ws.send(JSON.stringify({ type: "error", data: { message: e?.message ?? "error" } }));
+      transport.onMessage = (type, data) => {
+        if (type === "send" && (data.text as string)?.trim()) {
+          const threadId = (data.thread as string) ?? "default";
+          this.handleSend(transport, threadId, (data.text as string).trim()).catch(() => {});
+        } else if (type === "list_dir") {
+          this.handleListDir(transport, (data.path as string) ?? "/").catch(() => {});
         }
-      });
+      };
     });
 
     const cfg = this.config;
@@ -62,7 +63,7 @@ export class PiBridge {
 
   // ── Send ────────────────────────────────────────────────────────────
 
-  private async handleSend(ws: WebSocket, threadId: string, text: string) {
+  private async handleSend(transport: Transport, threadId: string, text: string) {
     const tid = threadId;
     let ts: ThreadState | undefined | null = threadSessions.get(threadId);
 
@@ -73,7 +74,7 @@ export class PiBridge {
       if (!newCwd) return;
       const resolved = pathLib.resolve(newCwd);
       if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-        ws.send(JSON.stringify({ type: "text_delta", data: { text: `❌ Not a directory: ${resolved}`, seq: 0, more: false } }));
+        transport.send("text_delta", { text: `❌ Not a directory: ${resolved}`, seq: 0, more: false });
         return;
       }
       // Dispose old session for this thread, create new one
@@ -81,34 +82,34 @@ export class PiBridge {
       const created = await this.createSession(resolved);
       if (created) {
         threadSessions.set(threadId, created);
-        ws.send(JSON.stringify({ type: "state_sync", data: { cwd: resolved } }));
+        transport.send("state_sync", { cwd: resolved });
       }
       return;
     }
 
     if (!ts) {
       ts = await this.createSession(this.config.cwd);
-      if (!ts) { ws.send(JSON.stringify({ type: "error", data: { message: "Failed" } })); return; }
+      if (!ts) { transport.send("error", { message: "Failed to create session" }); return; }
       threadSessions.set(threadId, ts);
     }
 
-    if (await this.handleCommand(ts, ws, text)) return;
+    if (await this.handleCommand(ts, transport, text)) return;
     ts.lastActivity = Date.now();
-    await this.runPrompt(ts, ws, text, threadId);
+    await this.runPrompt(ts, transport, text, threadId);
   }
 
   // ── List directory ─────────────────────────────────────────────────
 
-  private async handleListDir(ws: WebSocket, dirPath: string) {
+  private async handleListDir(transport: Transport, dirPath: string) {
     try {
       const resolved = pathLib.resolve(dirPath);
       const entries = fs.readdirSync(resolved, { withFileTypes: true })
         .filter(d => d.isDirectory())
         .map(d => ({ name: d.name, path: pathLib.join(resolved, d.name) }))
         .sort((a, b) => a.name.localeCompare(b.name));
-      ws.send(JSON.stringify({ type: "dir_list", data: { path: resolved, entries } }));
+      transport.send("dir_list", { path: resolved, entries });
     } catch (e: any) {
-      ws.send(JSON.stringify({ type: "dir_list", data: { path: dirPath, entries: [], error: e?.message } }));
+      transport.send("dir_list", { path: dirPath, entries: [], error: e?.message });
     }
   }
 
@@ -132,9 +133,9 @@ export class PiBridge {
 
   // ── Commands ──────────────────────────────────────────────────────
 
-  private async handleCommand(ts: ThreadState, ws: WebSocket, text: string): Promise<boolean> {
+  private async handleCommand(ts: ThreadState, transport: Transport, text: string): Promise<boolean> {
     const cmd = text.toLowerCase();
-    const send = (t: string) => ws.send(JSON.stringify({ type: "text_delta", data: { text: t, seq: 0, more: false } }));
+    const send = (t: string) => transport.send("text_delta", { text: t, seq: 0, more: false });
 
     if (cmd === "/help" || cmd === "!help") { send("Commands: /model <name>, /models, /dir <path>, /reset, /stats"); return true; }
     if (cmd === "/stats" || cmd === "!stats") { send(`Model: ${ts.currentModel}\nCWD: ${ts.cwd}`); return true; }
@@ -174,11 +175,11 @@ export class PiBridge {
 
   // ── Run prompt ────────────────────────────────────────────────────
 
-  private async runPrompt(ts: ThreadState, ws: WebSocket, promptText: string, tid: string) {
+  private async runPrompt(ts: ThreadState, transport: Transport, promptText: string, tid: string) {
     let responseText = "", thinkingText = "", deltaSeq = 0;
     let currentMessageId: string | undefined;
     let unsub: (() => void) | undefined;
-    const send = (type: string, data: any) => ws.send(JSON.stringify({ type, data: { ...data, thread: tid } }));
+    const send = (type: string, data: any) => transport.send(type, { ...data, thread: tid });
 
     /** Flush the current accumulated responseText as a completed segment. */
     function flushResponse() {
