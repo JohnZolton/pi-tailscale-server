@@ -99,7 +99,9 @@ export class WebRtcManager {
       onIce: (msg, fromPubkey) => this.handleIce(msg, fromPubkey),
       onPairingRequest: (msg, fromPubkey) => {
         console.log(`[webrtc] Pairing request from ${fromPubkey.slice(0, 12)}...`);
-        // App will follow with a webrtc-offer
+        // Send acknowledgment back to confirm Nostr DM round-trip works
+        signaler.sendMessage(fromPubkey, { type: "pairing-ack", pairingCode: identity.pairingCode });
+        console.log(`[webrtc] Sent pairing-ack to ${fromPubkey.slice(0, 12)}`);
       },
     });
 

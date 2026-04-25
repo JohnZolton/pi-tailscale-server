@@ -23,7 +23,8 @@ export type SignalingMessage =
   | { type: "webrtc-offer"; pairingCode: string; sdp: string; sessionPubkey: string }
   | { type: "webrtc-answer"; sdp: string }
   | { type: "webrtc-ice"; candidate: string }
-  | { type: "pairing-request"; appPubkey: string; pairingCode: string };
+  | { type: "pairing-request"; appPubkey: string; pairingCode: string }
+  | { type: "pairing-ack"; pairingCode: string };
 
 /** Callbacks invoked when a signaling message arrives. */
 export interface SignalingCallbacks {
