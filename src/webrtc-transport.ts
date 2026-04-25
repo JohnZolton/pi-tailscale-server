@@ -97,6 +97,10 @@ export class WebRtcManager {
       onOffer: (msg, fromPubkey) => this.handleOffer(msg, fromPubkey),
       onAnswer: (msg, fromPubkey) => this.handleAnswer(msg, fromPubkey),
       onIce: (msg, fromPubkey) => this.handleIce(msg, fromPubkey),
+      onPairingRequest: (msg, fromPubkey) => {
+        console.log(`[webrtc] Pairing request from ${fromPubkey.slice(0, 12)}...`);
+        // App will follow with a webrtc-offer
+      },
     });
 
     console.log("[webrtc] Manager ready");
