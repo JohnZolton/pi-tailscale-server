@@ -2,17 +2,16 @@
  * Nostr DM transport for agent frames.
  *
  * Implements the Transport interface so the bridge can send/receive
- * agent frames (text_delta, tool_call, thinking, etc.) over NIP-44
- * encrypted Nostr DMs instead of WebSocket or WebRTC.
+ * agent frames over NIP-44 encrypted Nostr DMs.
  *
- * This replaces Tailscale entirely — no NAT issues, no ports, no VPN.
+ * Buffers streaming frames during a turn and sends the complete
+ * response as a single Nostr DM — no streaming over relays.
  */
 
 import { nip44, finalizeEvent, Relay, type Event } from "nostr-tools";
 import { type Transport } from "./transport.js";
 import type { BridgeIdentity } from "./identity.js";
 
-/** Hex-string to Uint8Array. */
 function hexToBytes(hex: string): Uint8Array {
   const len = hex.length >> 1;
   const bytes = new Uint8Array(len);
@@ -20,10 +19,18 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Nostr-based transport — sends/receives JSON frames as NIP-44 encrypted
- * Nostr DMs. Pair with the Android NostrTransport.
- */
+/** A single agent frame. */
+interface Frame {
+  type: string;
+  data: Record<string, unknown>;
+}
+
+/** Inbound Nostr messages wrap the original WS frame. */
+interface InboundMessage {
+  type: string;
+  data: Record<string, unknown>;
+}
+
 export class NostrTransport implements Transport {
   readonly peerId: string;
   private identity: BridgeIdentity;
@@ -32,6 +39,10 @@ export class NostrTransport implements Transport {
   private relay: Relay | undefined;
   private convKey: Uint8Array | undefined;
   private unsub: (() => void) | undefined;
+
+  // Buffer frames per turn
+  private frameBuffer: Frame[] = [];
+  private hasPendingResponse = false;
 
   onOpen?: () => void;
   onMessage?: (type: string, data: Record<string, unknown>) => void;
@@ -43,55 +54,50 @@ export class NostrTransport implements Transport {
     this.identity = identity;
     this.appPubkey = appPubkey;
     this.relays = relays;
-
-    // Pre-compute conversation key
     const skBytes = hexToBytes(identity.privkey);
     this.convKey = nip44.getConversationKey(skBytes, appPubkey);
   }
 
-  /** Connect to relay and subscribe for incoming frames. */
   async start(): Promise<void> {
     for (const url of this.relays) {
       try {
         this.relay = await Relay.connect(url);
-        console.log(`[nostr-transport] Connected to ${url}`);
+        console.log(`[nostr] Connected to ${url}`);
 
-        // Subscribe for events from the app
         const sub = this.relay.subscribe(
           [{ kinds: [1059], "#p": [this.identity.pubkey] }],
           { onevent: (event: Event) => this.handleIncoming(event) },
         );
         this.unsub = () => sub.close();
 
-        console.log(`[nostr-transport] Listening for frames from ${this.appPubkey.slice(0, 12)}...`);
+        console.log(`[nostr] Listening for frames from ${this.appPubkey.slice(0, 12)}...`);
         this.onOpen?.();
         return;
       } catch (e) {
-        console.warn(`[nostr-transport] Failed ${url}: ${(e as Error).message}`);
+        console.warn(`[nostr] Failed ${url}: ${(e as Error).message}`);
       }
     }
     this.onError?.(new Error("No relays available"));
   }
 
+  /** Send a frame. Buffers streaming frames, sends complete response on turn_complete. */
   send(type: string, data: Record<string, unknown>): void {
-    if (!this.relay || !this.convKey) return;
+    // Buffer text/thinking/tool frames
+    if (type === "text_delta" || type === "thinking" || type === "tool_call") {
+      this.hasPendingResponse = true;
+      this.frameBuffer.push({ type, data });
+      return;
+    }
 
-    const payload = JSON.stringify({ type: "frame", frameType: type, data });
-    const ciphertext = nip44.encrypt(payload, this.convKey);
+    // On turn_complete, flush the buffer as one DM
+    if (type === "turn_complete") {
+      this.frameBuffer.push({ type, data });
+      this.flushResponse();
+      return;
+    }
 
-    const event = finalizeEvent(
-      {
-        kind: 1059,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [["p", this.appPubkey]],
-        content: ciphertext,
-      },
-      hexToBytes(this.identity.privkey),
-    );
-
-    this.relay.publish(event).catch((e) =>
-      console.warn(`[nostr-transport] Publish failed: ${(e as Error).message}`),
-    );
+    // For other types (state_sync, error, dir_list), send immediately
+    this.publishFrame({ type, data });
   }
 
   close(): void {
@@ -101,32 +107,51 @@ export class NostrTransport implements Transport {
 
   // ── Private ──
 
+  /** Publish a single frame as an encrypted Nostr DM. */
+  private publishFrame(frame: Frame): void {
+    if (!this.relay || !this.convKey) return;
+
+    const payload = JSON.stringify({ type: "frame", frames: [frame] });
+    const ciphertext = nip44.encrypt(payload, this.convKey);
+
+    const event = finalizeEvent(
+      { kind: 1059, created_at: Math.floor(Date.now() / 1000), tags: [["p", this.appPubkey]], content: ciphertext },
+      hexToBytes(this.identity.privkey),
+    );
+
+    this.relay.publish(event).catch(() => {});
+  }
+
+  /** Send buffered frames as a single Nostr DM. */
+  private flushResponse(): void {
+    if (!this.relay || !this.convKey || this.frameBuffer.length === 0) return;
+
+    const payload = JSON.stringify({ type: "frame", frames: this.frameBuffer });
+    const ciphertext = nip44.encrypt(payload, this.convKey);
+
+    const event = finalizeEvent(
+      { kind: 1059, created_at: Math.floor(Date.now() / 1000), tags: [["p", this.appPubkey]], content: ciphertext },
+      hexToBytes(this.identity.privkey),
+    );
+
+    this.relay.publish(event).catch(() => {});
+    this.frameBuffer = [];
+    this.hasPendingResponse = false;
+  }
+
   private handleIncoming(event: Event): void {
     if (!this.convKey) return;
 
-    // Check p-tag targets us
     const pTags = event.tags.filter((t) => t[0] === "p");
     if (!pTags.some((t) => t[1] === this.identity.pubkey)) return;
     if (event.pubkey !== this.appPubkey) return;
 
-    // Decrypt
     let plaintext: string;
-    try {
-      plaintext = nip44.decrypt(event.content, this.convKey);
-    } catch {
-      return;
-    }
+    try { plaintext = nip44.decrypt(event.content, this.convKey); } catch { return; }
 
-    // Parse frame
-    let frame: any;
-    try {
-      frame = JSON.parse(plaintext);
-    } catch {
-      return;
-    }
+    let msg: InboundMessage;
+    try { msg = JSON.parse(plaintext); } catch { return; }
 
-    if (frame.type === "frame") {
-      this.onMessage?.(frame.frameType ?? "send", frame.data ?? {});
-    }
+    this.onMessage?.(msg.type ?? "send", msg.data ?? {});
   }
 }
