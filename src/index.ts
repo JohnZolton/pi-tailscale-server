@@ -22,7 +22,7 @@ import { loadConfig } from "./config.js";
 import { PiBridge } from "./bridge.js";
 import { loadOrCreateIdentity, getPairingData } from "./identity.js";
 import { NostrSignaler } from "./signaler.js";
-import { WebRtcManager } from "./webrtc-transport.js";
+import { NostrTransport } from "./nostr-transport.js";
 
 async function main() {
   const config = loadConfig();
@@ -36,15 +36,26 @@ async function main() {
   const bridge = new PiBridge(config);
   await bridge.start();
 
-  // ── 3. Nostr signaling + WebRTC ──
+  // ── 3. Nostr signaling + DM transport ──
   const signaler = new NostrSignaler(identity);
-  const webrtc = new WebRtcManager(identity, signaler);
 
-  // When a WebRTC DataChannel opens, plug it into the bridge
-  webrtc.onTransport = (transport) => {
-    console.log(`[index] WebRTC transport ready: ${transport.peerId}`);
-    bridge.addTransport(transport);
-  };
+  // When a pairing-request arrives, create a NostrTransport for that peer
+  signaler.on({
+    onPairingRequest: (msg, fromPubkey) => {
+      console.log(`[index] Pairing request from ${fromPubkey.slice(0, 12)}...`);
+
+      // Create Nostr transport for this peer
+      const transport = new NostrTransport(identity, fromPubkey, identity.relays);
+      transport.onOpen = () => {
+        console.log(`[index] Nostr transport ready for ${fromPubkey.slice(0, 12)}`);
+        bridge.addTransport(transport);
+      };
+      transport.start().catch((e) => console.warn("[index] transport error:", e.message));
+
+      // Send ack
+      signaler.sendMessage(fromPubkey, { type: "pairing-ack", pairingCode: identity.pairingCode });
+    },
+  });
 
   signaler.start().catch((e) => console.warn("[signal] start error:", e.message));
 
